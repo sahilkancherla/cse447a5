@@ -91,7 +91,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
-        self.W_Q, self.W_K, self.W_V = config.attn_init_fn()
+        self.W_Q, self.W_K, self.W_V = config.attn_init_fn(self.n_embd)
         self.attn_fn = config.attn_fn
 
     def forward(self, x):
