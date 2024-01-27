@@ -94,10 +94,12 @@ class CausalSelfAttention(nn.Module):
         self.W_Q, self.W_K, self.W_V = config.attn_init_fn(self.n_embd)
         self.attn_fn = config.attn_fn
 
-    def forward(self, x):
+    def forward(self, x, mask_tokens=None):
         #B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         Q,K,V = self.W_Q(x), self.W_K(x), self.W_V(x)
         y = self.attn_fn(Q,K,V, n_heads=self.n_head, causal=True)
+        if mask_tokens is not None:
+            y[mask_tokens] = 0
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
@@ -121,8 +123,8 @@ class Block(nn.Module):
         m = self.mlp
         self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # MLP forward
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, mask_tokens=None):
+        x = x + self.attn(self.ln_1(x), mask_tokens=mask_tokens)
         x = x + self.mlpf(self.ln_2(x))
         return x
 
@@ -302,12 +304,14 @@ class GPT(nn.Module):
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
 
+        mask_tokens = (idx == self.pad_token)
+
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, mask_tokens=mask_tokens)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
 
