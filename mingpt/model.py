@@ -147,6 +147,7 @@ class GPT(nn.Module):
         # added by cse447/517
         C.attn_init_fn = None
         C.attn_fn = None
+        C.pad_token = -1
         return C
 
     def __init__(self, config):
@@ -154,6 +155,7 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.block_size = config.block_size
+        self.pad_token = config.pad_token
 
         type_given = config.model_type is not None
         params_given = all([config.n_layer is not None, config.n_head is not None, config.n_embd is not None])
@@ -312,7 +314,7 @@ class GPT(nn.Module):
         # if we are given some desired targets also calculate the loss
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=self.pad_token)
 
         return logits, loss
 
