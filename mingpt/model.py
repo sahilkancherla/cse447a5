@@ -159,6 +159,8 @@ class GPT(nn.Module):
         self.block_size = config.block_size
         self.pad_token = config.pad_token
 
+        self.use_fixed_positional_encoding = getattr(config, 'use_fixed_positional_encoding', False)
+        
         type_given = config.model_type is not None
         params_given = all([config.n_layer is not None, config.n_head is not None, config.n_embd is not None])
         assert type_given ^ params_given # exactly one of these (XOR)
@@ -302,25 +304,33 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
-
+        
         mask_tokens = (idx == self.pad_token)
-
+        
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+        
+        if self.use_fixed_positional_encoding:
+            # Use fixed sinusoidal positional encodings
+            pos_emb = self.get_sinusoidal_positional_encoding(t, tok_emb.size(-1)).to(device)
+        else:
+            # Use learned positional embeddings
+            pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
+            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+        
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x, mask_tokens=mask_tokens)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
-
+        
         # if we are given some desired targets also calculate the loss
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=self.pad_token)
-
+        
         return logits, loss
+
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):
@@ -351,3 +361,24 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+    
+    def get_sinusoidal_positional_encoding(self, seq_len, d_model):
+        """
+        Generate sinusoidal positional encodings.
+        
+        Args:
+            seq_len: Length of the sequence
+            d_model: Dimension of the model embeddings
+            
+        Returns:
+            Tensor of shape (1, seq_len, d_model) containing positional encodings
+        """
+        position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
+        pe = torch.zeros(1, seq_len, d_model)
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+        
+        return pe
+
