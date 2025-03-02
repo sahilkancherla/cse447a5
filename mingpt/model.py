@@ -107,10 +107,15 @@ class RotaryPositionalEmbeddings(nn.Module):
         sin = self.sin_cached[:, :, :seq_len, :]
         
         # Apply rotary embeddings
+        # Ensure cos and sin have the right shape
+        cos = cos[..., :x.shape[-1]//2]  # Only take half the values
+        sin = sin[..., :x.shape[-1]//2]  # Only take half the values
+
         x_rope = torch.cat([
             x[..., ::2] * cos - x[..., 1::2] * sin,
             x[..., 1::2] * cos + x[..., ::2] * sin
         ], dim=-1)
+
         
         return x_rope
 
@@ -438,16 +443,6 @@ class GPT(nn.Module):
         pe[0, :, 1::2] = torch.cos(position * div_term)
         
         return pe
-    
-    def get_rope_embeddings(self, dim, seq_len, base=10000):
-        # Create rotation matrices for query and key vectors
-        theta = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        seq_idx = torch.arange(seq_len, dtype=torch.float)
-        idx_theta = torch.outer(seq_idx, theta).float()
-        
-        cos = idx_theta.cos()
-        sin = idx_theta.sin()
-        
-        return cos, sin
+
 
 
