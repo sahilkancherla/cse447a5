@@ -310,13 +310,15 @@ class GPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         
-        if self.use_fixed_positional_encoding:
-            # Use fixed sinusoidal positional encodings
-            pos_emb = self.get_sinusoidal_positional_encoding(t, tok_emb.size(-1)).to(device)
-        else:
-            # Use learned positional embeddings
-            pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
-            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+        # if self.use_fixed_positional_encoding:
+        #     # Use fixed sinusoidal positional encodings
+        #     pos_emb = self.get_sinusoidal_positional_encoding(t, tok_emb.size(-1)).to(device)
+        # else:
+        #     # Use learned positional embeddings
+        #     pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
+        #     pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+            
+        pos_emb = self.get_sinusoidal_positional_encoding(t, tok_emb.size(-1)).to(device)
         
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
