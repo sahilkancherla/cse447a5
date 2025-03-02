@@ -70,40 +70,111 @@ class NewGELU(nn.Module):
 #        y = self.resid_dropout(self.c_proj(y))
 #        return y
 
+class RotaryPositionalEmbeddings(nn.Module):
+    def __init__(self, dim, max_seq_len=2048, base=10000):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+        
+        # Generate and cache the sinusoidal frequencies
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+        self.generate_cache()
+        
+    def generate_cache(self):
+        # Generate the cache for fast access during forward pass
+        seq_len = self.max_seq_len
+        t = torch.arange(seq_len, dtype=torch.float)
+        freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+        # Cache the embeddings
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :])
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :])
+    
+    def forward(self, x, seq_len=None):
+        # x: [batch, seq_len, n_head, head_dim]
+        if seq_len > self.max_seq_len:
+            # Regenerate cache for longer sequences
+            self.max_seq_len = seq_len
+            self.generate_cache()
+            
+        return self.apply_rotary_pos_emb(x, seq_len)
+    
+    def apply_rotary_pos_emb(self, x, seq_len=None):
+        seq_len = seq_len or x.shape[1]
+        cos = self.cos_cached[:, :, :seq_len, :]
+        sin = self.sin_cached[:, :, :seq_len, :]
+        
+        # Apply rotary embeddings
+        x_rope = torch.cat([
+            x[..., ::2] * cos - x[..., 1::2] * sin,
+            x[..., 1::2] * cos + x[..., ::2] * sin
+        ], dim=-1)
+        
+        return x_rope
 
 class CausalSelfAttention(nn.Module):
-    """
-    Attention layer which pulls its implementation from the config, with a
-    projection at the end.
-    """
-
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        # self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        # output projection
+        
+        # Key, query, value projections
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        # regularization
+        
+        # Regularization
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
-        # causal mask to ensure that attention is only applied to the left in the input sequence
+        
+        # Dimensions
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-
-        self.W_Q, self.W_K, self.W_V = config.attn_init_fn(self.n_embd)
-        self.attn_fn = config.attn_fn
-
+        self.head_dim = config.n_embd // config.n_head
+        
+        # Add rotary positional embeddings
+        self.rope = RotaryPositionalEmbeddings(self.head_dim)
+        
+        # Register causal mask
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                     .view(1, 1, config.block_size, config.block_size))
+    
     def forward(self, x, mask_tokens=None):
-        #B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        Q,K,V = self.W_Q(x), self.W_K(x), self.W_V(x)
-        y = self.attn_fn(Q,K,V, n_heads=self.n_head, causal=True)
+        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality
+        
+        # Calculate query, key, values for all heads in batch
+        qkv = self.c_attn(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # Reshape: (B, T, C) -> (B, T, n_head, head_dim) -> (B, n_head, T, head_dim)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        
+        # Apply rotary position embeddings
+        q = self.rope(q, T)
+        k = self.rope(k, T)
+        
+        # Compute attention
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        
         if mask_tokens is not None:
-            y[mask_tokens] = 0
-
-        # output projection
+            # Apply token masking if provided
+            mask = mask_tokens.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
+            att = att.masked_fill(mask, float('-inf'))
+            
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        
+        # Apply attention to values
+        y = att @ v  # (B, n_head, T, head_dim)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, n_embd)
+        
+        # Output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
+
 
 
 class Block(nn.Module):
@@ -307,31 +378,25 @@ class GPT(nn.Module):
         
         mask_tokens = (idx == self.pad_token)
         
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        # Forward the GPT model
+        tok_emb = self.transformer.wte(idx)  # token embeddings (b, t, n_embd)
         
-        # if self.use_fixed_positional_encoding:
-        #     # Use fixed sinusoidal positional encodings
-        #     pos_emb = self.get_sinusoidal_positional_encoding(t, tok_emb.size(-1)).to(device)
-        # else:
-        #     # Use learned positional embeddings
-        #     pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
-        #     pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
-            
-        pos_emb = self.get_sinusoidal_positional_encoding(t, tok_emb.size(-1)).to(device)
+        # No need to add positional embeddings since RoPE handles it
+        x = self.transformer.drop(tok_emb)
         
-        x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x, mask_tokens=mask_tokens)
+        
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
         
-        # if we are given some desired targets also calculate the loss
+        # Calculate loss if targets are provided
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=self.pad_token)
         
         return logits, loss
+
 
 
     @torch.no_grad()
@@ -365,16 +430,6 @@ class GPT(nn.Module):
         return idx
     
     def get_sinusoidal_positional_encoding(self, seq_len, d_model):
-        """
-        Generate sinusoidal positional encodings.
-        
-        Args:
-            seq_len: Length of the sequence
-            d_model: Dimension of the model embeddings
-            
-        Returns:
-            Tensor of shape (1, seq_len, d_model) containing positional encodings
-        """
         position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         
@@ -383,4 +438,16 @@ class GPT(nn.Module):
         pe[0, :, 1::2] = torch.cos(position * div_term)
         
         return pe
+    
+    def get_rope_embeddings(self, dim, seq_len, base=10000):
+        # Create rotation matrices for query and key vectors
+        theta = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        seq_idx = torch.arange(seq_len, dtype=torch.float)
+        idx_theta = torch.outer(seq_idx, theta).float()
+        
+        cos = idx_theta.cos()
+        sin = idx_theta.sin()
+        
+        return cos, sin
+
 
