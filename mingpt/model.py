@@ -103,21 +103,31 @@ class RotaryPositionalEmbeddings(nn.Module):
     
     def apply_rotary_pos_emb(self, x, seq_len=None):
         seq_len = seq_len or x.shape[1]
-        cos = self.cos_cached[:, :, :seq_len, :]
-        sin = self.sin_cached[:, :, :seq_len, :]
+    
+        # Get the appropriate slice of cached values
+        cos = self.cos_cached[:, :, :seq_len, :]  # [1, 1, seq_len, dim]
+        sin = self.sin_cached[:, :, :seq_len, :]  # [1, 1, seq_len, dim]
+        
+        # Split the input tensor into even and odd dimensions
+        x_even = x[..., ::2]  # Even dimensions
+        x_odd = x[..., 1::2]  # Odd dimensions
+        
+        # Ensure cos and sin have the right shape for broadcasting
+        # They should have shape [1, 1, seq_len, dim//2]
+        cos = cos[..., :self.dim//2]
+        sin = sin[..., :self.dim//2]
         
         # Apply rotary embeddings
-        # Ensure cos and sin have the right shape
-        cos = cos[..., :x.shape[-1]//2]  # Only take half the values
-        sin = sin[..., :x.shape[-1]//2]  # Only take half the values
-
-        x_rope = torch.cat([
-            x[..., ::2] * cos - x[..., 1::2] * sin,
-            x[..., 1::2] * cos + x[..., ::2] * sin
-        ], dim=-1)
-
+        x_even_rotated = x_even * cos - x_odd * sin
+        x_odd_rotated = x_odd * cos + x_even * sin
+        
+        # Interleave the rotated dimensions
+        x_rope = torch.zeros_like(x)
+        x_rope[..., ::2] = x_even_rotated
+        x_rope[..., 1::2] = x_odd_rotated
         
         return x_rope
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
